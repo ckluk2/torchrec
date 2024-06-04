@@ -436,7 +436,7 @@ def shard_quant_model(
 
     model = _shard_modules(
         module=model,
-        device=torch.device("meta"),
+        device=torch.device("cuda"),
         plan=model_plan,
         env=trec_dist.ShardingEnv.from_local(
             world_size,

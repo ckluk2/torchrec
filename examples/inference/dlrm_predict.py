@@ -10,28 +10,32 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
-import torchrec.distributed as trec_dist
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner import (
-    EmbeddingShardingPlanner,
-    ParameterConstraints,
-    Topology,
-)
-from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
-from torchrec.distributed.types import ShardingType
 from torchrec.inference.model_packager import load_pickle_config
 from torchrec.inference.modules import (
     PredictFactory,
     PredictModule,
-    quantize_embeddings,
 )
 from torchrec.models.dlrm import DLRM
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
+from torchrec.datasets.random import RandomRecDataset
+from torchrec.datasets.utils import Batch
+from torchrec.fx.tracer import Tracer
+from torchrec.inference.modules import shard_quant_model, quantize_inference_model
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+def create_training_batch(args) -> Batch:
+    return RandomRecDataset(
+        keys=DEFAULT_CAT_NAMES,
+        batch_size=args.batch_size,
+        hash_size=args.num_embedding_features,
+        ids_per_feature=1,
+        num_dense=len(DEFAULT_INT_NAMES),
+    ).batch_generator._generate_batch()
 # OSS Only
 
 
@@ -44,6 +48,7 @@ class DLRMModelConfig:
     num_embeddings_per_feature: List[int]
     num_embeddings: int
     over_arch_layer_sizes: List[int]
+    sample_input: Batch
 
 
 class DLRMPredictModule(PredictModule):
@@ -161,36 +166,32 @@ class DLRMPredictFactory(PredictFactory):
             dense_device=device,
         )
 
-        sharders = [
-            QuantEmbeddingBagCollectionSharder(),
-        ]
+        table_fqns = []
+        for name, _ in module.named_modules():
+            if "t_" in name:
+                table_fqns.append(name.split(".")[-1])
 
-        constraints = {}
-        for feature_name in self.model_config.id_list_features_keys:
-            constraints[f"t_{feature_name}"] = ParameterConstraints(
-                sharding_types=[ShardingType.TABLE_WISE.value],
-                compute_kernels=[EmbeddingComputeKernel.QUANT.value],
-            )
+        quant_model = quantize_inference_model(module)
+        sharded_model, _ = shard_quant_model(quant_model, table_fqns)
 
-        module = quantize_embeddings(module, dtype=torch.qint8, inplace=True)
+        batch = {}
+        batch["float_features"] = self.model_config.sample_input.dense_features.cuda()
+        batch["id_list_features.lengths"] = self.model_config.sample_input.sparse_features.lengths().cuda()
+        batch["id_list_features.values"] = self.model_config.sample_input.sparse_features.values().cuda()
 
-        plan = EmbeddingShardingPlanner(
-            topology=Topology(
-                world_size=world_size,
-                compute_device="cuda",
-                local_world_size=world_size,
-            ),
-            constraints=constraints,
-        ).plan(module, sharders)
 
-        return trec_dist.DistributedModelParallel(
-            module=module,
-            device=device,
-            env=trec_dist.ShardingEnv.from_local(world_size, default_cuda_rank),
-            plan=plan,
-            sharders=sharders,
-            init_data_parallel=False,
-        )
+        import pdb; pdb.set_trace()
+        sharded_model(batch)
+
+        tracer = Tracer(leaf_modules=["IntNBitTableBatchedEmbeddingBagsCodegen"])
+
+        graph = tracer.trace(sharded_model)
+        gm = torch.fx.GraphModule(sharded_model, graph)
+
+        gm(batch)
+        scripted_gm = torch.jit.script(gm)
+        scripted_gm(batch)
+        return scripted_gm
 
     def batching_metadata(self) -> Dict[str, str]:
         return {

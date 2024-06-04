@@ -9,38 +9,8 @@ import argparse
 import sys
 from typing import List
 
-from dlrm_predict import DLRMModelConfig, DLRMPredictFactory
-from torch.package import PackageExporter
+from dlrm_predict import DLRMModelConfig, test_dlrm_create_predict_module, create_training_batch
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
-from torchrec.inference.model_packager import PredictFactoryPackager
-
-# OSS Only
-
-
-class DLRMPredictFactoryPackager(PredictFactoryPackager):
-    @classmethod
-    def set_extern_modules(cls, pe: PackageExporter) -> None:
-        pe.extern(
-            [
-                "io",
-                "_imp",
-                "_ctypes",
-                "_string",
-                "numpy.**",
-                "pandas.**",
-                "pyarrow.**",
-                "six.moves",
-                "sys",
-            ]
-        )
-
-    @classmethod
-    def set_mocked_modules(cls, pe: PackageExporter) -> None:
-        pe.mock(
-            [
-                "markupsafe._speedups",
-            ]
-        )
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -111,6 +81,10 @@ def main(argv: List[str]) -> None:
 
     args = parse_args(argv)
 
+    args.batch_size = 10
+    args.num_embedding_features = 26
+    batch = create_training_batch(args)
+
     model_config = DLRMModelConfig(
         dense_arch_layer_sizes=list(map(int, args.dense_arch_layer_sizes.split(","))),
         dense_in_features=args.num_dense_features,
@@ -121,12 +95,14 @@ def main(argv: List[str]) -> None:
         ),
         num_embeddings=args.num_embeddings,
         over_arch_layer_sizes=list(map(int, args.over_arch_layer_sizes.split(","))),
+        sample_input=batch,
     )
 
-    DLRMPredictFactoryPackager.save_predict_factory(
-        DLRMPredictFactory, {"config.pkl": model_config}, args.output_path, {}
-    )
+    script_module = test_dlrm_create_predict_module(model_config)
+
+    script_module.save(args.output_path)
     print(f"Package is saved to {args.output_path}")
+
 
 
 if __name__ == "__main__":

@@ -27,13 +27,6 @@
 #include <glog/logging.h>
 #include <torch/csrc/autograd/profiler.h>
 
-// remove this after we switch over to multipy externally for torchrec
-#ifdef FBCODE_CAFFE2
-#include <multipy/runtime/deploy.h> // @manual
-#else
-#include <torch/csrc/deploy/deploy.h> // @manual
-#endif
-
 #include "ATen/cuda/CUDAEvent.h"
 #include "torchrec/inference/BatchingQueue.h"
 #include "torchrec/inference/ExceptionHandler.h"
